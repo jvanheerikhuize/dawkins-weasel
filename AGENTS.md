@@ -16,6 +16,7 @@ Target phrase: `METHINKS IT IS LIKE A WEASEL` (28 characters, alphabet of 26 let
 |---|---|
 | `random_variation.sh` | Pure random search — generates a fresh string each attempt, never carries information forward |
 | `cumulative_selection.sh` | Cumulative selection — breeds, scores, and selects each generation; progress is never discarded |
+| `optimised_selection.sh` | Optimised cumulative selection — adds gene pool, two-parent crossover, and adaptive mutation rate |
 | `README.md` | User-facing documentation |
 | `LICENSE` | MIT |
 
@@ -32,6 +33,14 @@ naming convention. Functions are prefixed:
 This separation is intentional and should be preserved in any changes.
 
 ## Algorithms
+
+### `optimised_selection.sh` — `model_next_generation()` (three optimisations)
+
+1. **Gene pool** (`POOL_SIZE=5` elites kept simultaneously): multiple lineages coexist across generations, providing the standing variation that makes recombination productive. Maps to genetic diversity in a sexual population.
+
+2. **Two-parent crossover**: each offspring inherits positions `0..(xp-1)` from parent A and `xp..(LEN-1)` from parent B, where `xp` is a random split. When pool members have evolved different correct characters, a single crossover can combine two half-solved strings. Maps to meiotic recombination.
+
+3. **Adaptive mutation rate**: baseline is `BASE_MUT_RATE` (5%). After `STALL_THRESHOLD` (10) consecutive non-improving generations, rate rises to `STRESS_MUT_RATE` (20%) to force broader exploration, then resets when improvement is found. Maps to the bacterial SOS response — error-prone polymerases are expressed under stress and repressed when the cell recovers.
 
 ### `random_variation.sh` — `model_generate()`
 
@@ -58,19 +67,24 @@ Progress is cumulative and irreversible. This is the key structural difference f
 ```bash
 ./random_variation.sh        # press Ctrl+C to stop — it will never terminate naturally
 ./cumulative_selection.sh    # converges in ~50–80 generations
+./optimised_selection.sh     # converges faster via crossover + adaptive mutation
 ```
 
 No dependencies beyond `bash`. Scripts are already marked executable.
 
 ## Key constants (top of each script)
 
-| Constant | Default | Effect |
-|---|---|---|
-| `TARGET` | `METHINKS IT IS LIKE A WEASEL` | The phrase to reach |
-| `ALPHABET` | `A–Z + space` | Symbol set (27 characters) |
-| `POPULATION` | 100 (cumulative only) | Offspring per generation |
-| `MUTATION_RATE` | 5 (cumulative only) | % chance each character mutates |
-| `DISPLAY_LOSERS` | 4 (cumulative only) | Eliminated offspring shown per gen |
+| Constant | Default | Script(s) | Effect |
+|---|---|---|---|
+| `TARGET` | `METHINKS IT IS LIKE A WEASEL` | all | The phrase to reach |
+| `ALPHABET` | `A–Z + space` | all | Symbol set (27 characters) |
+| `POPULATION` | 100 | cumulative, optimised | Offspring per generation |
+| `MUTATION_RATE` | 5 | cumulative | % chance each character mutates |
+| `BASE_MUT_RATE` | 5 | optimised | Baseline % mutation rate |
+| `STRESS_MUT_RATE` | 20 | optimised | Elevated rate during stalling |
+| `STALL_THRESHOLD` | 10 | optimised | Gens without improvement before stress |
+| `POOL_SIZE` | 5 | optimised | Elite parents kept simultaneously |
+| `DISPLAY_LOSERS` | 3–4 | cumulative, optimised | Eliminated offspring shown per gen |
 
 ## What to avoid
 
