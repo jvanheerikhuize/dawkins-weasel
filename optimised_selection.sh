@@ -1,19 +1,48 @@
 #!/usr/bin/env bash
-# optimised_selection.sh — Dawkins' Weasel: optimised cumulative selection
+# optimised_selection.sh — Dawkins' Weasel: population-level evolution
 # Architecture: MVP  (Model · View · Presenter)
 #
-# Three optimisations over cumulative_selection.sh, each mapping to a real
-# mechanism in evolutionary biology:
+# Three biological corrections over the previous version (same three-mechanism
+# frame, each replaced with a more accurate model):
 #
-#   1. Gene pool       — keep POOL_SIZE elite parents simultaneously
-#                        → standing genetic variation in a sexual population
+#   CORRECTION 1 — Immortal elite pool → True evolving population
+#     Before: 5 fixed "champion" strings lived across all generations; only the
+#             single best new offspring could enter the pool each generation.
+#             This is truncation selection at its extreme — 99 of 100 offspring
+#             contributed nothing — and the champions were never replaced, even
+#             when the population had long since moved past them.
+#     After:  POP_SIZE individuals evolve together; the entire generation is
+#             replaced by its offspring (non-overlapping generations, as in
+#             annual plants and many insects).  No individual survives by merit
+#             of past fitness alone.  Progress is held statistically across
+#             allele frequencies, not locked in an immortal lineage.
 #
-#   2. Two-parent crossover — breed each offspring from two parents at a
-#                        random split point
-#                        → meiotic recombination / sexual reproduction
+#   CORRECTION 2 — Single-point crossover → Uniform crossover
+#     Before: a single random split point forced the two "halves" of the genome
+#             to always be co-inherited as intact blocks.  Positions 0 and 1
+#             were as tightly linked as positions 0 and 13 — there was no
+#             within-block recombination at all.
+#     After:  each position is drawn independently from parent A or B with
+#             equal probability.  For a 28-character string, this models the
+#             dense recombination expected across a short, highly shuffled
+#             chromosome — the realistic case for independent loci.  Beneficial
+#             mutations that arose in different lineages can now be combined
+#             position by position, not only as intact halves.
 #
-#   3. Adaptive μ      — raise mutation rate after prolonged stalling
-#                        → stress-induced mutagenesis (bacterial SOS response)
+#   CORRECTION 3 — Winner-takes-all → Tournament selection (with drift)
+#     Before: exactly one offspring — the highest scorer out of 100 — advanced
+#             per generation.  All others contributed zero.  Selection had no
+#             stochastic element; it was fully deterministic.
+#     After:  parents are chosen by random TOURNAMENT_SIZE-way competition.
+#             A less-fit individual can win a tournament by luck; a fitter one
+#             can be passed over.  This finite-population stochasticity is
+#             genetic drift, present in every real population.  Selection is
+#             real but probabilistic, exactly as in nature.
+#
+#   RETAINED — Adaptive μ (stress-induced mutagenesis)
+#     Stall is now measured against population mean fitness rather than the
+#     champion's score.  A stalled mean signals a population-wide plateau;
+#     a stalled champion while the mean rises is just convergence.
 
 # ─── CONSTANTS ────────────────────────────────────────────────────────────────
 
@@ -21,12 +50,13 @@ TARGET="METHINKS IT IS LIKE A WEASEL"
 ALPHABET="ABCDEFGHIJKLMNOPQRSTUVWXYZ "
 LEN=${#TARGET}
 ALPHA_LEN=${#ALPHABET}
-POPULATION=100
-BASE_MUT_RATE=5         # baseline % chance each character mutates per offspring
-STRESS_MUT_RATE=20      # elevated rate triggered by prolonged stalling
-STALL_THRESHOLD=10      # consecutive non-improving gens before stress kicks in
-POOL_SIZE=5             # elite parents kept across generations
-DISPLAY_LOSERS=3        # eliminated offspring shown per generation
+
+POP_SIZE=50               # true evolving population
+TOURNAMENT_SIZE=3         # individuals competing per parent-selection event
+BASE_MUT_RATE=5           # baseline % mutation per position per offspring
+STRESS_MUT_RATE=20        # elevated rate after prolonged mean-fitness stall
+STALL_THRESHOLD=15        # consecutive non-improving gens before stress
+DISPLAY_COUNT=5           # individuals shown from population per generation
 
 # ─── COLORS ───────────────────────────────────────────────────────────────────
 
@@ -44,17 +74,17 @@ WHITE=$'\e[97m'
 # MODEL — pure logic, no output
 # ═══════════════════════════════════════════════════════════════════════════════
 
-M_POOL=()             # elite parent strings, sorted best-first
-M_POOL_SCORES=()      # their scores
+M_POP=()              # current population strings
+M_POP_SCORES=()       # fitness scores (index-aligned with M_POP)
 M_GENERATION=0
+M_BEST=""             # fittest individual in current generation
+M_BEST_SCORE=0
+M_MEAN_SCORE=0        # mean population fitness
+M_PREV_MEAN=0         # mean score of previous generation (stall detection)
 M_STALL=0
 M_MUT_RATE=$BASE_MUT_RATE
 M_STRESSED=0
-M_PREV_BEST=0
-M_LAST_XP=0           # crossover split point used by winning offspring this gen
-M_LAST_PA=""          # parent A string for the winning offspring
-M_LAST_PB=""          # parent B string for the winning offspring
-M_SAMPLE=()           # reservoir sample of losing offspring (for display)
+M_SAMPLE=()           # top-DISPLAY_COUNT individuals for display
 M_SAMPLE_SCORES=()
 M_START=$SECONDS
 
@@ -66,113 +96,106 @@ model_score() {
     done
 }
 
-# Insert a string into M_POOL, keeping it sorted descending by score and
-# capped at POOL_SIZE. Exact duplicates are rejected to preserve diversity.
-model_pool_insert() {
-    local str="$1" score=$2
-    local n=${#M_POOL[@]}
-
-    for (( i=0; i<n; i++ )); do
-        [[ "${M_POOL[$i]}" == "$str" ]] && return
-    done
-
-    if (( n < POOL_SIZE )); then
-        M_POOL+=("$str")
-        M_POOL_SCORES+=($score)
-    elif (( score > ${M_POOL_SCORES[$((n-1))]} )); then
-        M_POOL[$((n-1))]="$str"
-        M_POOL_SCORES[$((n-1))]=$score
-    else
-        return
-    fi
-
-    # Bubble the new entry upward to maintain descending order
-    n=${#M_POOL[@]}
-    for (( i=n-1; i>0; i-- )); do
-        if (( ${M_POOL_SCORES[$i]} > ${M_POOL_SCORES[$((i-1))]} )); then
-            local ts="${M_POOL[$i]}"
-            local tsc=${M_POOL_SCORES[$i]}
-            M_POOL[$i]="${M_POOL[$((i-1))]}"
-            M_POOL_SCORES[$i]=${M_POOL_SCORES[$((i-1))]}
-            M_POOL[$((i-1))]="$ts"
-            M_POOL_SCORES[$((i-1))]=$tsc
-        else
-            break
+# Tournament selection: draw TOURNAMENT_SIZE individuals uniformly at random
+# from the current population and return the index of the fittest.
+# The probabilistic nature is deliberate — a weaker individual can win by the
+# luck of who they happen to compete against.  Tournament size controls
+# selection pressure: size 2 ≈ weak, drift-dominated; size = POP_SIZE ≈
+# deterministic truncation.  Size 3 sits in the biologically realistic middle.
+model_tournament() {
+    local best_idx=$(( RANDOM % POP_SIZE ))
+    local best_sc=${M_POP_SCORES[$best_idx]}
+    for (( t=1; t<TOURNAMENT_SIZE; t++ )); do
+        local idx=$(( RANDOM % POP_SIZE ))
+        if (( ${M_POP_SCORES[$idx]} > best_sc )); then
+            best_idx=$idx
+            best_sc=${M_POP_SCORES[$idx]}
         fi
     done
+    _tournament_idx=$best_idx
+}
+
+model_compute_stats() {
+    M_BEST_SCORE=0
+    M_BEST=""
+    local total=0
+    for (( i=0; i<POP_SIZE; i++ )); do
+        local sc=${M_POP_SCORES[$i]}
+        (( total += sc ))
+        if (( sc > M_BEST_SCORE )); then
+            M_BEST_SCORE=$sc
+            M_BEST="${M_POP[$i]}"
+        fi
+    done
+    M_MEAN_SCORE=$(( total / POP_SIZE ))
 }
 
 model_init() {
-    M_POOL=()
-    M_POOL_SCORES=()
-    local seed=""
-    for (( i=0; i<LEN; i++ )); do
-        seed+="${ALPHABET:$(( RANDOM % ALPHA_LEN )):1}"
+    M_POP=()
+    M_POP_SCORES=()
+    for (( p=0; p<POP_SIZE; p++ )); do
+        local ind=""
+        for (( i=0; i<LEN; i++ )); do
+            ind+="${ALPHABET:$(( RANDOM % ALPHA_LEN )):1}"
+        done
+        model_score "$ind"
+        M_POP+=("$ind")
+        M_POP_SCORES+=($_score)
     done
-    model_score "$seed"
-    M_POOL=("$seed")
-    M_POOL_SCORES=($_score)
+    model_compute_stats
     M_GENERATION=0
     M_STALL=0
     M_MUT_RATE=$BASE_MUT_RATE
     M_STRESSED=0
-    M_PREV_BEST=0
-    M_LAST_XP=0
-    M_LAST_PA=""
-    M_LAST_PB=""
-    M_SAMPLE=()
-    M_SAMPLE_SCORES=()
+    M_PREV_MEAN=0
     M_START=$SECONDS
 }
 
 model_next_generation() {
     # ┌─────────────────────────────────────────────────────────────────────┐
-    # │  ALGORITHM: optimised cumulative selection                          │
-    # │    Opt 1 — gene pool:    breed from POOL_SIZE elites, not one       │
-    # │    Opt 2 — crossover:    two-parent recombination at random split   │
-    # │    Opt 3 — adaptive μ:   mutation rate rises when stalling          │
+    # │  ALGORITHM: population-level evolution                              │
+    # │    Fix 1 — true population:   POP_SIZE individuals, full turnover  │
+    # │    Fix 2 — uniform crossover: each position independently from A/B │
+    # │    Fix 3 — tournament select: probabilistic selection + drift       │
     # └─────────────────────────────────────────────────────────────────────┘
 
-    M_PREV_BEST=${M_POOL_SCORES[0]}
+    M_PREV_MEAN=$M_MEAN_SCORE
 
-    # Snapshot the pool so all offspring in this generation are bred from the
-    # same starting parents — breeding mid-generation would bias later offspring
-    # toward a pool that has already absorbed earlier wins.
-    local snap=("${M_POOL[@]}")
-    local sn=${#snap[@]}
+    local new_pop=()
+    local new_scores=()
 
-    local best_off="" best_score=-1 best_pa="" best_pb="" best_xp=0
-    local disp_pool=() disp_scores=()
+    for (( p=0; p<POP_SIZE; p++ )); do
+        # Fix 3 — select parent A via tournament.
+        model_tournament
+        local pa_idx=$_tournament_idx
 
-    for (( p=0; p<POPULATION; p++ )); do
-        # Opt 1 — select two distinct parents from the pool snapshot.
-        # A pool of POOL_SIZE means separate evolutionary lineages coexist,
-        # each having fixed different beneficial mutations. This standing
-        # variation is what makes recombination productive — without it,
-        # crossing two identical parents yields nothing new.
-        local pa_idx=$(( RANDOM % sn ))
-        local pb_idx
-        if (( sn > 1 )); then
-            pb_idx=$(( RANDOM % (sn - 1) ))
-            (( pb_idx >= pa_idx )) && (( pb_idx++ ))
-        else
-            pb_idx=$pa_idx   # pool not yet diverse: crossover degrades to clone
-        fi
+        # Select parent B; re-draw until a distinct individual is chosen.
+        # Mating with an identical individual makes crossover equivalent to
+        # cloning — it contributes nothing beyond what mutation alone provides.
+        local pb_idx=$pa_idx
+        local tries=0
+        while (( pb_idx == pa_idx && tries < 10 )); do
+            model_tournament
+            pb_idx=$_tournament_idx
+            (( tries++ ))
+        done
 
-        # Opt 2 — two-parent crossover at a uniformly random split point.
-        # The offspring inherits positions 0..(xp-1) from parent A and
-        # positions xp..(LEN-1) from parent B.
-        # This can instantly combine, e.g., the well-evolved left half of
-        # one lineage with the well-evolved right half of another — a
-        # shortcut that sequential single-parent mutation cannot take.
-        local xp=$(( RANDOM % (LEN - 1) + 1 ))
-        local child="${snap[$pa_idx]:0:$xp}${snap[$pb_idx]:$xp}"
+        # Fix 2 — uniform crossover: each of the LEN positions is drawn
+        # independently from parent A or B with equal probability.
+        # Unlike a single split point (which locks two large always-co-inherited
+        # blocks), uniform crossover can produce any combination of the two
+        # parents' correct characters in a single offspring — the equivalent of
+        # dense, evenly spaced crossover events along the chromosome.
+        local child=""
+        for (( i=0; i<LEN; i++ )); do
+            if (( RANDOM % 2 == 0 )); then
+                child+="${M_POP[$pa_idx]:$i:1}"
+            else
+                child+="${M_POP[$pb_idx]:$i:1}"
+            fi
+        done
 
-        # Opt 3 — mutate at the current adaptive rate.
-        # Normally this is BASE_MUT_RATE (5%), the same as the baseline script.
-        # After STALL_THRESHOLD consecutive non-improving generations the rate
-        # rises to STRESS_MUT_RATE (20%), forcing broader exploration.
-        # The rate drops back to baseline as soon as improvement is seen.
+        # Point mutation at the current adaptive rate.
         local mutated=""
         for (( i=0; i<LEN; i++ )); do
             if (( RANDOM % 100 < M_MUT_RATE )); then
@@ -181,45 +204,29 @@ model_next_generation() {
                 mutated+="${child:$i:1}"
             fi
         done
-        child="$mutated"
 
-        model_score "$child"
-
-        if (( _score > best_score )); then
-            best_score=$_score
-            best_off="$child"
-            best_pa="${snap[$pa_idx]}"
-            best_pb="${snap[$pb_idx]}"
-            best_xp=$xp
-        fi
-
-        # Reservoir sample of losers for display
-        if (( ${#disp_pool[@]} < DISPLAY_LOSERS )); then
-            disp_pool+=("$child")
-            disp_scores+=("$_score")
-        else
-            local ridx=$(( RANDOM % (p + 1) ))
-            if (( ridx < DISPLAY_LOSERS )); then
-                disp_pool[$ridx]="$child"
-                disp_scores[$ridx]=$_score
-            fi
-        fi
+        model_score "$mutated"
+        new_pop+=("$mutated")
+        new_scores+=($_score)
     done
 
-    # Advance: insert the best offspring into the pool.
-    # Crucially, existing pool members are NOT discarded — the pool retains its
-    # diverse lineages across generations, so recombination stays productive
-    # even as the population converges.
-    model_pool_insert "$best_off" $best_score
-
-    M_LAST_XP=$best_xp
-    M_LAST_PA="$best_pa"
-    M_LAST_PB="$best_pb"
+    # Fix 1 — full generational replacement.  No individual survives to the
+    # next generation by merit of past performance — only through offspring.
+    # Progress is preserved because fit parents were more likely to win
+    # tournaments and so more likely to have offspring in this new generation;
+    # correct characters propagate via allele frequency, not individual
+    # immortality.
+    M_POP=("${new_pop[@]}")
+    M_POP_SCORES=("${new_scores[@]}")
 
     (( M_GENERATION++ ))
+    model_compute_stats
 
-    # Adapt mutation rate: stall detection and stress response.
-    if (( M_POOL_SCORES[0] > M_PREV_BEST )); then
+    # Stall detection on population mean, not the champion.
+    # A champion can plateau while the rest of the population catches up —
+    # that is convergence, not stalling.  A stalled mean signals the whole
+    # population is on a plateau and broader exploration is needed.
+    if (( M_MEAN_SCORE > M_PREV_MEAN )); then
         M_STALL=0
         M_STRESSED=0
         M_MUT_RATE=$BASE_MUT_RATE
@@ -231,18 +238,23 @@ model_next_generation() {
         fi
     fi
 
-    # Build display sample, excluding current pool members to avoid repeats
+    # Build display sample: top DISPLAY_COUNT individuals by fitness.
+    local -a used
+    for (( i=0; i<POP_SIZE; i++ )); do used[$i]=0; done
+
     M_SAMPLE=()
     M_SAMPLE_SCORES=()
-    for (( s=0; s<${#disp_pool[@]}; s++ )); do
-        local in_pool=0
-        for pm in "${M_POOL[@]}"; do
-            [[ "${disp_pool[$s]}" == "$pm" ]] && in_pool=1 && break
+    for (( d=0; d<DISPLAY_COUNT; d++ )); do
+        local top_idx=0 top_sc=-1
+        for (( i=0; i<POP_SIZE; i++ )); do
+            if (( !used[$i] && ${M_POP_SCORES[$i]} > top_sc )); then
+                top_sc=${M_POP_SCORES[$i]}
+                top_idx=$i
+            fi
         done
-        if (( !in_pool )); then
-            M_SAMPLE+=("${disp_pool[$s]}")
-            M_SAMPLE_SCORES+=("${disp_scores[$s]}")
-        fi
+        M_SAMPLE+=("${M_POP[$top_idx]}")
+        M_SAMPLE_SCORES+=($top_sc)
+        used[$top_idx]=1
     done
 }
 
@@ -250,7 +262,6 @@ model_next_generation() {
 # VIEW — display only, never mutates state
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Sets _color based on score percentage
 _score_color() {
     local pct=$(( $1 * 100 / $2 ))
     if   (( pct >= 90 )); then _color=$GREEN
@@ -260,7 +271,6 @@ _score_color() {
     fi
 }
 
-# Print one string character-by-character: green=match, red=wrong; dimmed variant available
 _view_string() {
     local str="$1" dimmed=$2
     for (( i=0; i<LEN; i++ )); do
@@ -280,12 +290,11 @@ _view_string() {
 view_header() {
     printf "\n"
     printf "${BOLD}${MAGENTA}  ╔══════════════════════════════════════════════════════╗${RESET}\n"
-    printf "${BOLD}${MAGENTA}  ║     DAWKINS' WEASEL  ·  OPTIMISED SELECTION          ║${RESET}\n"
+    printf "${BOLD}${MAGENTA}  ║     DAWKINS' WEASEL  ·  POPULATION EVOLUTION         ║${RESET}\n"
     printf "${BOLD}${MAGENTA}  ╚══════════════════════════════════════════════════════╝${RESET}\n\n"
     printf "  ${DIM}Target  »${RESET} ${BOLD}${WHITE}%s${RESET}\n" "$TARGET"
-    printf "  ${DIM}Start   »${RESET} ${DIM}%s${RESET}\n" "${M_POOL[0]}"
-    printf "  ${DIM}Config  »${RESET} ${DIM}%d offspring/gen  ·  pool %d  ·  μ %d%%→%d%% after %d stall gens${RESET}\n" \
-        "$POPULATION" "$POOL_SIZE" "$BASE_MUT_RATE" "$STRESS_MUT_RATE" "$STALL_THRESHOLD"
+    printf "  ${DIM}Config  »${RESET} ${DIM}%d individuals · tournament %d · μ %d%%→%d%% after %d stall gens${RESET}\n" \
+        "$POP_SIZE" "$TOURNAMENT_SIZE" "$BASE_MUT_RATE" "$STRESS_MUT_RATE" "$STALL_THRESHOLD"
     printf "\n  ${DIM}──────────────────────────────────────────────────────${RESET}\n\n"
 }
 
@@ -294,68 +303,35 @@ view_reasoning() {
 }
 
 view_generation() {
-    _score_color "${M_POOL_SCORES[0]}" "$LEN"
+    _score_color "$M_BEST_SCORE" "$LEN"
     local col="$_color"
 
-    # ── generation header ─────────────────────────────────────────────────────
     local mu_tag
     if (( M_STRESSED )); then
         mu_tag="${RED}${BOLD}[stress: μ=${M_MUT_RATE}%]${RESET}"
     else
         mu_tag="${DIM}[μ=${M_MUT_RATE}%]${RESET}"
     fi
-    printf "  ${DIM}── Gen %4d ──────────────────────────── ${RESET}${col}${BOLD}%2d${RESET}${DIM}/%d ──${RESET}  %b\n" \
-        "$M_GENERATION" "${M_POOL_SCORES[0]}" "$LEN" "$mu_tag"
 
-    # ── gene pool ─────────────────────────────────────────────────────────────
-    local pn=${#M_POOL[@]}
-    for (( i=0; i<pn; i++ )); do
-        _score_color "${M_POOL_SCORES[$i]}" "$LEN"
-        if (( i == 0 )); then
+    # ── generation header ─────────────────────────────────────────────────────
+    printf "  ${DIM}── Gen %4d ──── best ${RESET}${col}${BOLD}%2d${RESET}${DIM}  mean %2d/%d ──${RESET}  %b\n" \
+        "$M_GENERATION" "$M_BEST_SCORE" "$M_MEAN_SCORE" "$LEN" "$mu_tag"
+
+    # ── top individuals in current population ─────────────────────────────────
+    for (( s=0; s<${#M_SAMPLE[@]}; s++ )); do
+        local sc="${M_SAMPLE_SCORES[$s]}"
+        _score_color "$sc" "$LEN"
+        if (( s == 0 )); then
             printf "  ${BOLD}●${RESET}  "
-            _view_string "${M_POOL[$i]}" 0
-            printf "   ${_color}${BOLD}%2d${RESET}${DIM}/%d${RESET}\n" "${M_POOL_SCORES[$i]}" "$LEN"
+            _view_string "${M_SAMPLE[$s]}" 0
+            printf "   ${_color}${BOLD}%2d${RESET}${DIM}/%d${RESET}\n" "$sc" "$LEN"
         else
             printf "  ${DIM}●  "
-            _view_string "${M_POOL[$i]}" 1
-            printf "   ${_color}%2d${RESET}${DIM}/%d${RESET}\n" "${M_POOL_SCORES[$i]}" "$LEN"
+            _view_string "${M_SAMPLE[$s]}" 1
+            printf "   ${_color}%2d${RESET}${DIM}/%d${RESET}\n" "$sc" "$LEN"
         fi
     done
     printf "\n"
-
-    # ── eliminated offspring ──────────────────────────────────────────────────
-    for (( s=0; s<${#M_SAMPLE[@]}; s++ )); do
-        local sc="${M_SAMPLE_SCORES[$s]}"
-        printf "  ${DIM}${RED}✗${RESET}  ${DIM}"
-        _view_string "${M_SAMPLE[$s]}" 1
-        printf "${RESET}   ${DIM}%2d/%d${RESET}\n" "$sc" "$LEN"
-    done
-
-    # ── crossover parents ─────────────────────────────────────────────────────
-    if [[ "$M_LAST_PA" != "$M_LAST_PB" ]]; then
-        printf "  ${DIM}─ cross ×%-2d ─────────────────────────────────────────────${RESET}\n" "$M_LAST_XP"
-        printf "  ${DIM}A  "
-        _view_string "$M_LAST_PA" 1
-        printf "${RESET}\n"
-        printf "  ${DIM}B  "
-        _view_string "$M_LAST_PB" 1
-        printf "${RESET}\n"
-    else
-        printf "  ${DIM}─ (pool size 1 — crossover not yet available) ───────────────${RESET}\n"
-    fi
-
-    # ── selected ──────────────────────────────────────────────────────────────
-    printf "  ${DIM}─ selected ──────────────────────────────────────────────${RESET}\n"
-    printf "  ${GREEN}${BOLD}✓${RESET}  "
-    _view_string "${M_POOL[0]}" 0
-    printf "   ${col}${BOLD}%2d${RESET}${DIM}/%d${RESET}" "${M_POOL_SCORES[0]}" "$LEN"
-    if (( M_POOL_SCORES[0] > M_PREV_BEST )); then
-        local delta=$(( M_POOL_SCORES[0] - M_PREV_BEST ))
-        printf "  ${GREEN}${BOLD}↑ +%d${RESET}" "$delta"
-    else
-        printf "  ${DIM}[=]${RESET}"
-    fi
-    printf "\n\n"
 }
 
 view_complete() {
@@ -365,11 +341,11 @@ view_complete() {
     printf "  ${BOLD}${GREEN}╚══════════════════════════════════════════════════════╝${RESET}\n\n"
     printf "  ${BOLD}${WHITE}%s${RESET}\n\n" "$TARGET"
     printf "  ${DIM}Generations  : %d${RESET}\n" "$M_GENERATION"
-    printf "  ${DIM}Population   : %d offspring/gen${RESET}\n" "$POPULATION"
-    printf "  ${DIM}Pool size    : %d${RESET}\n" "$POOL_SIZE"
+    printf "  ${DIM}Population   : %d individuals${RESET}\n" "$POP_SIZE"
+    printf "  ${DIM}Tournament   : size %d (probabilistic selection + drift)${RESET}\n" "$TOURNAMENT_SIZE"
     printf "  ${DIM}Mutation     : %d%% base  ·  %d%% stress${RESET}\n\n" "$BASE_MUT_RATE" "$STRESS_MUT_RATE"
-    view_reasoning "Crossover let separate lineages combine gains that sequential mutation would have had to accumulate one at a time."
-    view_reasoning "Compare the generation count to cumulative_selection.sh — same population, same baseline mutation rate."
+    view_reasoning "Selection was probabilistic throughout: fit individuals were more likely to reproduce, but not guaranteed. Progress accumulated in the population's allele frequencies, not in a single immortal champion."
+    view_reasoning "Uniform crossover allowed beneficial mutations that fixed in different lineages to be combined position by position — any combination the two parents could assemble in one offspring, not just swapped halves."
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -379,41 +355,41 @@ view_complete() {
 presenter_run() {
     model_init
     view_header
-    view_reasoning "Pool of $POOL_SIZE elites · two-parent crossover · adaptive μ (rises to ${STRESS_MUT_RATE}% after ${STALL_THRESHOLD} stall gens, resets on improvement)."
+    view_reasoning "A true population of $POP_SIZE individuals. Each generation every individual competes via tournament selection, reproduces through uniform crossover, and the old generation is fully replaced. No individual is guaranteed to survive — only genotypes that spread through the population endure."
 
     local hit_25=0 hit_50=0 hit_75=0 hit_90=0
     local stress_noted=0
 
-    while [[ "${M_POOL[0]}" != "$TARGET" ]]; do
+    while [[ "$M_BEST" != "$TARGET" ]]; do
         model_next_generation
         view_generation
 
-        local pct=$(( M_POOL_SCORES[0] * 100 / LEN ))
+        local pct=$(( M_BEST_SCORE * 100 / LEN ))
 
         if (( pct >= 25 && !hit_25 )); then
             hit_25=1
-            view_reasoning "25% match. The pool now holds distinct variants — crossover is mixing improvements that arose independently in separate lineages."
+            view_reasoning "25% match. Selection is shifting allele frequencies — correct characters appear in more individuals each generation, not just the best. It is the population, not any one organism, that is evolving."
         fi
         if (( pct >= 50 && !hit_50 )); then
             hit_50=1
-            view_reasoning "50% match. Each pool member has locked in different correct characters. A single crossover event can now combine two half-solved strings."
+            view_reasoning "50% match. Mean fitness trails best fitness — the population still carries diversity. Uniform crossover is assembling partial solutions that arose independently in different lineages."
         fi
         if (( pct >= 75 && !hit_75 )); then
             hit_75=1
-            view_reasoning "75% match. Pool members are converging — crossover yields diminishing returns as lineages share more correct characters."
+            view_reasoning "75% match. Population diversity is narrowing as most lineages converge on the same correct characters. Recombination yields diminishing returns; point mutation is now the primary source of new variation."
         fi
         if (( pct >= 90 && !hit_90 )); then
             hit_90=1
-            view_reasoning "90% match. Fine-tuning the last few positions. Mutation is doing most of the work now; the pool members are nearly identical."
+            view_reasoning "90% match. Near fixation — the correct characters have spread to nearly every individual. Mean and best fitness are converging. The final positions are resolved by mutation alone."
         fi
 
         if (( M_STRESSED && !stress_noted )); then
             stress_noted=1
-            view_reasoning "Stalled for $STALL_THRESHOLD generations — μ raised to ${STRESS_MUT_RATE}%. In bacteria, prolonged stress triggers the SOS pathway: error-prone polymerases are expressed, trading accuracy for exploration."
+            view_reasoning "Mean fitness stalled for $STALL_THRESHOLD generations — μ raised to ${STRESS_MUT_RATE}%. The population is on a fitness plateau. As in bacteria under antibiotic pressure, elevated mutagenesis trades short-term accuracy for broader exploration of the landscape."
         fi
         if (( !M_STRESSED && stress_noted )); then
             stress_noted=0
-            view_reasoning "Improvement found — μ reset to ${BASE_MUT_RATE}%. Stress response deactivated, as in cells that down-regulate error-prone polymerases once the environmental pressure lifts."
+            view_reasoning "Mean fitness improved — μ reset to ${BASE_MUT_RATE}%. The population has found a new gradient; elevated mutagenesis is no longer needed."
         fi
     done
 
