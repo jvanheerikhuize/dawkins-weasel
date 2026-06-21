@@ -9,7 +9,8 @@ ALPHABET="ABCDEFGHIJKLMNOPQRSTUVWXYZ "
 LEN=${#TARGET}
 ALPHA_LEN=${#ALPHABET}
 POPULATION=100
-MUTATION_RATE=5   # % chance each character mutates per offspring
+MUTATION_RATE=5      # % chance each character mutates per offspring
+DISPLAY_LOSERS=4     # how many eliminated offspring to show per generation
 
 # ─── COLORS ───────────────────────────────────────────────────────────────────
 
@@ -29,8 +30,10 @@ WHITE=$'\e[97m'
 M_PARENT=""
 M_SCORE=0
 M_GENERATION=0
-M_STALL=0          # generations without score improvement
+M_STALL=0
 M_PREV_SCORE=0
+M_SAMPLE=()           # reservoir sample of losing offspring (strings)
+M_SAMPLE_SCORES=()    # their scores
 
 model_init() {
     M_PARENT=""
@@ -44,9 +47,10 @@ model_init() {
     M_GENERATION=0
     M_STALL=0
     M_PREV_SCORE=0
+    M_SAMPLE=()
+    M_SAMPLE_SCORES=()
 }
 
-# Sets _score for a given string (uses no global state)
 model_score() {
     local s="$1"
     _score=0
@@ -55,12 +59,21 @@ model_score() {
     done
 }
 
-# Breeds POPULATION offspring, selects the best, advances one generation
 model_next_generation() {
+    # ┌─────────────────────────────────────────────────────────────────────┐
+    # │  ALGORITHM: cumulative selection (variation + selection per gen)    │
+    # └─────────────────────────────────────────────────────────────────────┘
+
     M_PREV_SCORE=$M_SCORE
     local best="$M_PARENT"
     local best_score=$M_SCORE
+    local pool=()
+    local pool_scores=()
 
+    # Step 1 — breed POPULATION offspring from the current parent.
+    # Each character is inherited unchanged, except when a random draw falls
+    # within MUTATION_RATE% — then it is replaced by a random alphabet symbol.
+    # Mutations are independent per character and per offspring.
     for (( p=0; p<POPULATION; p++ )); do
         local offspring=""
         for (( i=0; i<LEN; i++ )); do
@@ -70,13 +83,46 @@ model_next_generation() {
                 offspring+="${M_PARENT:$i:1}"
             fi
         done
+
+        # Step 2 — score the offspring: count exact positional matches.
         model_score "$offspring"
+
+        # Step 3 — selection: keep whichever single offspring scores highest.
+        # The parent itself is the starting baseline — it survives if no
+        # offspring beats it (elitism). Only one string advances; all others
+        # are discarded. This is what makes progress cumulative: each winner
+        # becomes the parent for the next round, so gains are never lost.
         if (( _score > best_score )); then
             best="$offspring"
             best_score=$_score
         fi
+
+        # Reservoir sampling — maintain a uniformly random sample of losers
+        # for display without biasing toward early or late offspring.
+        if (( ${#pool[@]} < DISPLAY_LOSERS )); then
+            pool+=("$offspring")
+            pool_scores+=("$_score")
+        else
+            local ridx=$(( RANDOM % (p + 1) ))
+            if (( ridx < DISPLAY_LOSERS )); then
+                pool[$ridx]="$offspring"
+                pool_scores[$ridx]=$_score
+            fi
+        fi
     done
 
+    # Exclude the winner from the loser sample to avoid duplicate display
+    M_SAMPLE=()
+    M_SAMPLE_SCORES=()
+    for (( s=0; s<${#pool[@]}; s++ )); do
+        if [[ "${pool[$s]}" != "$best" ]]; then
+            M_SAMPLE+=("${pool[$s]}")
+            M_SAMPLE_SCORES+=("${pool_scores[$s]}")
+        fi
+    done
+
+    # Step 4 — advance: the winner becomes the new parent. Progress is
+    # preserved unconditionally; the next generation never starts from scratch.
     M_PARENT="$best"
     M_SCORE=$best_score
     (( M_GENERATION++ ))
@@ -91,20 +137,14 @@ model_next_generation() {
 # VIEW — display only, never mutates state
 # ═══════════════════════════════════════════════════════════════════════════════
 
-view_bar() {
-    local score=$1 total=$2 width=28
-    local filled=$(( score * width / total ))
-    local pct=$(( score * 100 / total ))
-    local color
-    (( pct <  30 )) && color=$RED
-    (( pct >= 30 )) && color=$YELLOW
-    (( pct >= 60 )) && color=$CYAN
-    (( pct >= 90 )) && color=$GREEN
-    printf "${color}"
-    for (( i=0; i<filled;           i++ )); do printf "█"; done
-    printf "${DIM}"
-    for (( i=filled; i<width; i++ )); do printf "░"; done
-    printf "${RESET}"
+# Sets _color based on score percentage
+_score_color() {
+    local pct=$(( $1 * 100 / $2 ))
+    if   (( pct >= 90 )); then _color=$GREEN
+    elif (( pct >= 60 )); then _color=$CYAN
+    elif (( pct >= 30 )); then _color=$YELLOW
+    else                       _color=$RED
+    fi
 }
 
 view_header() {
@@ -122,28 +162,58 @@ view_reasoning() {
     printf "\n  ${CYAN}▸ %s${RESET}\n\n" "$1"
 }
 
-view_generation() {
-    local pct=$(( M_SCORE * 100 / LEN ))
-    local score_color
-    (( pct <  30 )) && score_color=$RED
-    (( pct >= 30 )) && score_color=$YELLOW
-    (( pct >= 60 )) && score_color=$CYAN
-    (( pct >= 90 )) && score_color=$GREEN
-
-    printf "  ${DIM}Gen %4d${RESET} │ " "$M_GENERATION"
-    view_bar "$M_SCORE" "$LEN"
-    printf " ${score_color}${BOLD}%2d${RESET}${DIM}/%d${RESET} │ " "$M_SCORE" "$LEN"
-
-    # Print each character: green+bold if correct, dim+red if wrong
+# Print one offspring string: correct chars vs wrong chars, dimmed or bold.
+_view_string() {
+    local str="$1" dimmed=$2
     for (( i=0; i<LEN; i++ )); do
-        local ch="${M_PARENT:$i:1}"
+        local ch="${str:$i:1}"
         if [[ "$ch" == "${TARGET:$i:1}" ]]; then
-            printf "${GREEN}${BOLD}%s${RESET}" "$ch"
+            if (( dimmed )); then
+                printf "${RESET}${DIM}%s${DIM}" "$ch"
+            else
+                printf "${GREEN}${BOLD}%s${RESET}" "$ch"
+            fi
         else
-            printf "${DIM}${RED}%s${RESET}" "$ch"
+            if (( dimmed )); then
+                printf "${RED}%s${RESET}${DIM}" "$ch"
+            else
+                printf "${DIM}${RED}%s${RESET}" "$ch"
+            fi
         fi
     done
-    printf "\n"
+}
+
+view_generation() {
+    _score_color "$M_SCORE" "$LEN"
+    local col="$_color"
+
+    # ── generation header ────────────────────────────────────────────────────
+    printf "  ${DIM}── Gen %4d ─────────────────────────────────────── ${RESET}${col}${BOLD}%2d${RESET}${DIM}/%d ──${RESET}\n" \
+        "$M_GENERATION" "$M_SCORE" "$LEN"
+
+    # ── eliminated offspring (losers) ────────────────────────────────────────
+    for (( s=0; s<${#M_SAMPLE[@]}; s++ )); do
+        local sc="${M_SAMPLE_SCORES[$s]}"
+        _score_color "$sc" "$LEN"
+        printf "  ${DIM}${RED}✗${RESET}  ${DIM}"
+        _view_string "${M_SAMPLE[$s]}" 1
+        printf "${RESET}   ${DIM}%2d/%d${RESET}\n" "$sc" "$LEN"
+    done
+
+    # ── divider ──────────────────────────────────────────────────────────────
+    printf "  ${DIM}─ selected ──────────────────────────────────────────────${RESET}\n"
+
+    # ── survivor ─────────────────────────────────────────────────────────────
+    printf "  ${GREEN}${BOLD}✓${RESET}  "
+    _view_string "$M_PARENT" 0
+    printf "   ${col}${BOLD}%2d${RESET}${DIM}/%d${RESET}" "$M_SCORE" "$LEN"
+    if (( M_SCORE > M_PREV_SCORE )); then
+        local delta=$(( M_SCORE - M_PREV_SCORE ))
+        printf "  ${GREEN}${BOLD}↑ +%d${RESET}" "$delta"
+    else
+        printf "  ${DIM}[=]${RESET}"
+    fi
+    printf "\n\n"
 }
 
 view_complete() {

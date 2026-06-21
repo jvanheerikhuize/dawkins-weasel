@@ -40,16 +40,29 @@ model_init() {
 }
 
 model_generate() {
+    # ┌─────────────────────────────────────────────────────────────────────┐
+    # │  ALGORITHM: pure random search (no memory between attempts)         │
+    # └─────────────────────────────────────────────────────────────────────┘
+
+    # Step 1 — generate a candidate by picking each character independently
+    # at random. No information from the previous attempt is used; every
+    # character slot is a fresh draw from the 27-symbol alphabet.
     M_CANDIDATE=""
     for (( i=0; i<LEN; i++ )); do
         M_CANDIDATE+="${ALPHABET:$(( RANDOM % ALPHA_LEN )):1}"
     done
     (( M_ATTEMPTS++ ))
 
+    # Step 2 — score the candidate: count how many positions match the target
+    # exactly. This is the fitness function — 28/28 means we found the target.
     local s=0
     for (( i=0; i<LEN; i++ )); do
         [[ "${M_CANDIDATE:$i:1}" == "${TARGET:$i:1}" ]] && (( s++ ))
     done
+
+    # Step 3 — track the all-time best score for display purposes only.
+    # Crucially, this best string is NEVER fed back into the next attempt —
+    # that is the key difference from cumulative selection.
     if (( s > M_BEST_SCORE )); then
         M_BEST_SCORE=$s
         M_BEST="$M_CANDIDATE"
@@ -60,10 +73,42 @@ model_generate() {
 # VIEW — display only, never mutates state
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Sets _color based on score percentage
+_score_color() {
+    local pct=$(( $1 * 100 / $2 ))
+    if   (( pct >= 90 )); then _color=$GREEN
+    elif (( pct >= 60 )); then _color=$CYAN
+    elif (( pct >= 30 )); then _color=$YELLOW
+    else                       _color=$RED
+    fi
+}
+
+# Print one string: correct chars in green, wrong chars in red (or dimmed variants)
+_view_string() {
+    local str="$1" dimmed=$2
+    for (( i=0; i<LEN; i++ )); do
+        local ch="${str:$i:1}"
+        if [[ "$ch" == "${TARGET:$i:1}" ]]; then
+            if (( dimmed )); then
+                printf "${RESET}${DIM}%s${DIM}" "$ch"
+            else
+                printf "${GREEN}${BOLD}%s${RESET}" "$ch"
+            fi
+        else
+            if (( dimmed )); then
+                printf "${RED}%s${RESET}${DIM}" "$ch"
+            else
+                printf "${DIM}${RED}%s${RESET}" "$ch"
+            fi
+        fi
+    done
+}
+
 view_bar() {
     local score=$1 total=$2 width=28
     local filled=$(( score * width / total ))
-    printf "${RED}"
+    _score_color "$score" "$total"
+    printf "${_color}"
     for (( i=0; i<filled;           i++ )); do printf "█"; done
     printf "${DIM}"
     for (( i=filled; i<width; i++ )); do printf "░"; done
@@ -88,14 +133,19 @@ view_progress() {
     local elapsed=$(( SECONDS - M_START ))
     local rate=0
     (( elapsed > 0 )) && rate=$(( M_ATTEMPTS / elapsed ))
-    printf "  ${DIM}%13d attempts  ·  %4ds  ·  ~%d/s${RESET}  │  %s\n" \
-        "$M_ATTEMPTS" "$elapsed" "$rate" "$M_CANDIDATE"
+    printf "  ${DIM}%13d attempts  ·  %4ds  ·  ~%d/s${RESET}  │  " \
+        "$M_ATTEMPTS" "$elapsed" "$rate"
+    _view_string "$M_CANDIDATE" 1
+    printf "\n"
 }
 
 view_best() {
-    printf "\n  ${YELLOW}${BOLD}Best so far »${RESET}  ${YELLOW}%s${RESET}  " "$M_BEST"
+    _score_color "$M_BEST_SCORE" "$LEN"
+    printf "\n  ${YELLOW}${BOLD}Best so far »${RESET}  "
+    _view_string "$M_BEST" 0
+    printf "  "
     view_bar "$M_BEST_SCORE" "$LEN"
-    printf "  ${YELLOW}${BOLD}%d/%d${RESET}\n\n" "$M_BEST_SCORE" "$LEN"
+    printf "  ${_color}${BOLD}%d/%d${RESET}\n\n" "$M_BEST_SCORE" "$LEN"
 }
 
 view_interrupted() {
